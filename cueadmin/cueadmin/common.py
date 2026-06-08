@@ -298,6 +298,17 @@ def getParser():
         "Jobs submitted to the archived show will be executed by "
         "allocations subscribed to the target show.",
     )
+
+    show.add_argument(
+        "-scheduler-managed",
+        action="store",
+        nargs=2,
+        metavar="SHOW ON|OFF",
+        help="Set whether accounting for the given show is owned by the Rust "
+        "scheduler. When ON, Cuebot stops updating accounting tables "
+        "transactionally for this show and the Rust scheduler reconciles "
+        "them from the proc table.",
+    )
     #
     # Allocation
     #
@@ -1254,6 +1265,22 @@ def handleArgs(args):
             show.archive,
             target_show_name,
         )
+
+    elif args.scheduler_managed:
+        show_name, value = args.scheduler_managed
+        if value.lower() not in ("on", "off"):
+            raise ValueError(
+                "Invalid value for -scheduler-managed: %r (expected ON or OFF)" % value
+            )
+        enabled = value.lower() == "on"
+        show = opencue.api.findShow(show_name)
+        verb = "Enable" if enabled else "Disable"
+        confirm(
+            "%s scheduler-managed accounting on %s" % (verb, opencue.rep(show)),
+            args.force,
+            show.setSchedulerManaged,
+            enabled,
+        )
     #
     # Hosts are handled a bit differently than the rest
     # of the entities. To specify a host or hosts the user
@@ -1378,7 +1405,7 @@ def handleArgs(args):
             % (opencue.rep(show), opencue.rep(alloc)),
             args.force,
             show.createSubscription,
-            alloc.data,
+            alloc,
             float(args.create_sub[2]),
             float(args.create_sub[3]),
         )

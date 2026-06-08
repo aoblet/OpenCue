@@ -18,7 +18,7 @@ use config::{Config as ConfigBase, Environment, File};
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{collections::HashSet, env, fs, path::PathBuf, time::Duration};
 
 static DEFAULT_CONFIG_FILE: &str = "~/.local/share/scheduler.yaml";
 
@@ -36,12 +36,72 @@ lazy_static! {
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(default)]
 pub struct Config {
+    pub sentry_dsn: Option<String>,
     pub logging: LoggingConfig,
     pub queue: QueueConfig,
     pub database: DatabaseConfig,
     pub rqd: RqdConfig,
     pub host_cache: HostCacheConfig,
     pub scheduler: SchedulerConfig,
+    pub accounting: AccountingConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AccountingConfig {
+    pub redis: RedisConfig,
+    /// Cadence at which booked counters are reseeded from `SUM(proc)` to both
+    /// the PG accounting tables and Redis (under the `acct:seq` CAS guard).
+    #[serde(with = "humantime_serde")]
+    pub recompute_interval: Duration,
+    /// Cadence at which limit fields (subscription burst, folder/job/point caps)
+    /// are reseeded from PG accounting tables to Redis.
+    #[serde(with = "humantime_serde")]
+    pub limit_reseed_interval: Duration,
+    /// TTL of the in-process `b_scheduler_managed=true` show-id cache.
+    #[serde(with = "humantime_serde")]
+    pub managed_shows_ttl: Duration,
+    /// Maximum CAS retries per reseed cycle before giving up and waiting for the
+    /// next cycle (per design §2.4).
+    pub cas_max_retries: u32,
+}
+
+impl Default for AccountingConfig {
+    fn default() -> Self {
+        Self {
+            redis: RedisConfig::default(),
+            recompute_interval: Duration::from_secs(120),
+            limit_reseed_interval: Duration::from_secs(300),
+            managed_shows_ttl: Duration::from_secs(30),
+            cas_max_retries: 3,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RedisConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub pool_size: u32,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "localhost".to_string(),
+            port: 6379,
+            pool_size: 20,
+        }
+    }
+}
+
+impl RedisConfig {
+    pub fn url(&self) -> String {
+        format!("redis://{}:{}/", self.host, self.port)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -76,14 +136,22 @@ pub struct QueueConfig {
     pub memory_stranded_threshold: ByteSize,
     #[serde(with = "humantime_serde")]
     pub job_back_off_duration: Duration,
+    /// Duration a cluster sleeps after a pass returned no dispatchable jobs.
+    /// Larger values reduce empty-pass query load on the database.
+    #[serde(with = "humantime_serde")]
+    pub cluster_empty_sleep: Duration,
     pub stream: StreamConfig,
+    /// Maximum number of jobs returned per cluster pass. Caps the per-pass
+    /// dispatch cost so a big-show cluster doesn't iterate thousands of jobs
+    /// in a single round. Strict `ORDER BY priority DESC` means low-priority
+    /// jobs are deferred to subsequent passes when the high-priority backlog
+    /// drains.
+    pub max_jobs_per_cluster_pass: i64,
     pub manual_tags_chunk_size: usize,
     pub hostname_tags_chunk_size: usize,
     pub host_candidate_attempts_per_layer: usize,
     pub empty_job_cycles_before_quiting: Option<usize>,
     pub mem_reserved_min: ByteSize,
-    #[serde(with = "humantime_serde")]
-    pub allocation_refresh_interval: Duration,
     pub selfish_services: Vec<String>,
     pub host_booking_strategy: HostBookingStrategy,
     pub frame_memory_soft_limit: f64,
@@ -100,13 +168,14 @@ impl Default for QueueConfig {
             core_multiplier: 100,
             memory_stranded_threshold: ByteSize::gib(2),
             job_back_off_duration: Duration::from_secs(300),
+            cluster_empty_sleep: Duration::from_secs(30),
             stream: StreamConfig::default(),
-            manual_tags_chunk_size: 100,
-            hostname_tags_chunk_size: 300,
+            max_jobs_per_cluster_pass: 20,
+            manual_tags_chunk_size: 50,
+            hostname_tags_chunk_size: 50,
             host_candidate_attempts_per_layer: 10,
             empty_job_cycles_before_quiting: None,
             mem_reserved_min: ByteSize::mib(250),
-            allocation_refresh_interval: Duration::from_secs(3),
             selfish_services: Vec::new(),
             host_booking_strategy: HostBookingStrategy::default(),
             frame_memory_soft_limit: 1.6,
@@ -244,6 +313,20 @@ pub struct SchedulerConfig {
     pub alloc_tags: Vec<AllocTag>,
     pub manual_tags: Vec<ManualTags>,
     pub ignore_tags: Vec<String>,
+}
+
+impl SchedulerConfig {
+    pub fn show_names(&self) -> Option<Vec<String>> {
+        let mut show_names: HashSet<String> = HashSet::from_iter(self.entire_shows.iter().cloned());
+        for tag in &self.alloc_tags {
+            show_names.insert(tag.show.clone());
+        }
+        if show_names.is_empty() {
+            None
+        } else {
+            Some(show_names.into_iter().collect())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -48,6 +48,8 @@ pub struct DispatchLayerModel {
     pub pk_job: String,
     pub pk_facility: String,
     pub pk_show: String,
+    pub pk_folder: String,
+    pub pk_dept: String,
     pub str_name: String,
     pub str_job_name: String,
     pub str_os: Option<String>,
@@ -71,6 +73,8 @@ pub struct LayerWithFramesModel {
     pub pk_job: String,
     pub pk_facility: String,
     pub pk_show: String,
+    pub pk_folder: String,
+    pub pk_dept: String,
     pub layer_name: String,
     pub job_name: String,
     pub str_os: Option<String>,
@@ -121,17 +125,14 @@ impl DispatchLayer {
         DispatchLayer {
             id: parse_uuid(&layer.pk_layer),
             job_id: parse_uuid(&layer.pk_job),
-            facility_id: parse_uuid(&layer.pk_facility),
+            facility_id: layer.pk_facility,
             show_id: parse_uuid(&layer.pk_show),
+            folder_id: parse_uuid(&layer.pk_folder),
+            dept_id: parse_uuid(&layer.pk_dept),
             job_name: layer.str_job_name,
             layer_name: layer.str_name,
             str_os: layer.str_os,
-            cores_min: CoreSize::from_multiplied(
-                layer
-                    .int_cores_min
-                    .try_into()
-                    .expect("int_cores_min should fit on a i32"),
-            ),
+            cores_min: CoreSize::from_multiplied(layer.int_cores_min),
             mem_min: ByteSize::kb(layer.int_mem_min as u64),
             threadable: layer.b_threadable,
             gpus_min: layer
@@ -139,7 +140,12 @@ impl DispatchLayer {
                 .try_into()
                 .expect("gpus_min should fit on a i32"),
             gpu_mem_min: ByteSize::kb(layer.int_gpu_mem_min as u64),
-            tags: layer.str_tags.split(" | ").map(|t| t.to_string()).collect(),
+            tags: layer
+                .str_tags
+                .split('|')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
             frames: frames.into_iter().map(|f| f.into()).collect(),
         }
     }
@@ -178,14 +184,20 @@ WITH dispatch_frames AS (
         f.int_layer_order,
         f.int_version,
         f.ts_updated,
-        -- Accumulate the number of cores that would be consumed
+        -- Accumulate the number of cores that would be consumed across all layers of the job
         SUM(l.int_cores_min) OVER (
-            PARTITION BY l.pk_layer
-            ORDER BY f.int_dispatch_order, f.int_layer_order
+            ORDER BY l.int_dispatch_order, f.int_dispatch_order, f.int_layer_order
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS aggr_job_cores,
+        -- Accumulate the number of gpus that would be consumed across all layers of the job
+        SUM(l.int_gpus_min) OVER (
+            ORDER BY l.int_dispatch_order, f.int_dispatch_order, f.int_layer_order
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS aggr_job_gpus,
         jr.int_max_cores as job_resource_core_limit,
         jr.int_cores as job_resource_consumed_cores,
+        jr.int_max_gpus as job_resource_gpu_limit,
+        jr.int_gpus as job_resource_consumed_gpus,
         -- Add row number to limit frames per layer
         ROW_NUMBER() OVER (
             PARTITION BY l.pk_layer
@@ -198,13 +210,14 @@ WITH dispatch_frames AS (
         INNER JOIN layer_stat ls on l.pk_layer = ls.pk_layer
     WHERE j.pk_job = $1
         AND ls.int_waiting_count > 0
-        AND string_to_array($2, ' | ') && string_to_array(l.str_tags, ' | ')
+        AND string_to_array(REPLACE($2, ' ', ''), '|') && string_to_array(REPLACE(l.str_tags, ' ', ''), '|')
         AND f.str_state = 'WAITING'
 ),
 limited_frames AS (
     SELECT * FROM dispatch_frames
     WHERE frame_rank <= $3  -- limit frames per layer
         AND (job_resource_core_limit <= 0 OR (aggr_job_cores + job_resource_consumed_cores <= job_resource_core_limit))
+        AND (job_resource_gpu_limit <= 0 OR (aggr_job_gpus + job_resource_consumed_gpus <= job_resource_gpu_limit))
 )
 SELECT DISTINCT
     -- Layer fields
@@ -212,6 +225,8 @@ SELECT DISTINCT
     j.pk_job,
     j.pk_facility,
     j.pk_show,
+    j.pk_folder,
+    j.pk_dept,
     l.str_name as layer_name,
     j.str_name as job_name,
     j.str_os,
@@ -270,7 +285,7 @@ FROM job j
     LEFT JOIN limited_frames lf ON l.pk_layer = lf.pk_layer
 WHERE j.pk_job = $1
     AND ls.int_waiting_count > 0
-    AND string_to_array($2, ' | ') && string_to_array(l.str_tags, ' | ')
+    AND string_to_array(REPLACE($2, ' ', ''), '|') && string_to_array(REPLACE(l.str_tags, ' ', ''), '|')
 ORDER BY
     l.int_dispatch_order,
     lf.int_dispatch_order,
@@ -350,6 +365,8 @@ impl LayerDao {
                 pk_job: model.pk_job.clone(),
                 pk_facility: model.pk_facility.clone(),
                 pk_show: model.pk_show.clone(),
+                pk_folder: model.pk_folder.clone(),
+                pk_dept: model.pk_dept.clone(),
                 str_name: model.layer_name.clone(),
                 str_job_name: model.job_name.clone(),
                 str_os: model.str_os.clone(),
@@ -451,8 +468,8 @@ impl LayerDao {
                     GROUP BY limit_record.pk_limit_record
                 ) AS sum_running ON limit_record.pk_limit_record = sum_running.pk_limit_record
                 WHERE layer.pk_layer = $1
-                    AND sum_running.int_sum_running < limit_record.int_max_value
-                    OR sum_running.int_sum_running IS NULL
+                    AND (sum_running.int_sum_running < limit_record.int_max_value
+                        OR sum_running.int_sum_running IS NULL)
         "#,
         )
         .bind(layer.id.to_string())

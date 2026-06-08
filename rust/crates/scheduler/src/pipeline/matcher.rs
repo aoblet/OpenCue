@@ -18,17 +18,17 @@ use std::{
     time::Duration,
 };
 
+use opencue_proto::host::ThreadMode;
 use uuid::Uuid;
 
 use crate::{
-    allocation::{allocation_service, AllocationService},
     cluster::Cluster,
     cluster_key::Tag,
     config::CONFIG,
     dao::LayerDao,
     host_cache::{host_cache_service, messages::*, HostCacheService},
     metrics,
-    models::{CoreSize, DispatchJob, DispatchLayer, Host},
+    models::{DispatchJob, DispatchLayer, Host},
     pipeline::{
         dispatcher::{
             error::DispatchError,
@@ -39,7 +39,7 @@ use crate::{
     },
 };
 use actix::Addr;
-use miette::{Context, Result};
+use miette::Result;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace};
 
@@ -59,7 +59,6 @@ pub struct MatchingService {
     layer_dao: LayerDao,
     dispatcher_service: Addr<RqdDispatcherService>,
     concurrency_semaphore: Arc<Semaphore>,
-    allocation_service: Arc<AllocationService>,
 }
 
 impl MatchingService {
@@ -85,9 +84,6 @@ impl MatchingService {
         let max_concurrent_transactions = (CONFIG.database.pool_size as usize).saturating_sub(1);
 
         let dispatcher_service = rqd_dispatcher_service().await?;
-        let allocation_service = allocation_service()
-            .await
-            .wrap_err("Failed to initialize AllocationService for MatchingService")?;
 
         Ok(MatchingService {
             host_service,
@@ -95,7 +91,6 @@ impl MatchingService {
             layer_dao,
             dispatcher_service,
             concurrency_semaphore: Arc::new(Semaphore::new(max_concurrent_transactions)),
-            allocation_service,
         })
     }
 
@@ -185,40 +180,22 @@ impl MatchingService {
         }
     }
 
-    /// Validates whether a host is suitable for a specific layer.
-    ///
-    /// Subscriptions: Check whether this hosts' subscription can book at least one frame
-    ///
-    /// # Arguments
-    ///
-    /// * `_host` - The host to validate
-    /// * `_layer_id` - The layer ID to validate against
-    ///
-    /// # Returns
-    ///
-    /// * `bool` - True if the match is valid
-    fn validate_match(
-        host: &Host,
-        _layer_id: &Uuid,
-        show_id: &Uuid,
-        cores_requested: CoreSize,
-        allocation_service: &AllocationService,
-        os: Option<&str>,
-    ) -> bool {
-        // Check OS compatibility
-        if host.str_os.as_deref() != os {
-            return false;
-        }
+    fn host_matches_layer_os(host: &Host, os: Option<&str>) -> bool {
+        os.is_none() || host.str_os.as_deref() == os
+    }
 
-        if let Some(subscription) = allocation_service.get_subscription(&host.alloc_name, show_id) {
-            if !subscription.bookable(&cores_requested) {
-                return false;
-            }
-        } else {
-            return false;
-        };
+    /// Mirrors Cuebot's DispatchQuery filter: hosts in ThreadMode::All only accept threadable
+    /// layers. Booking a non-threadable layer on such a host would diverge from Cuebot's behavior
+    /// and starve the layer when ownership of the show moves back to Cuebot.
+    fn host_matches_thread_mode(host: &Host, threadable: bool) -> bool {
+        !(host.thread_mode == ThreadMode::All && !threadable)
+    }
 
-        true
+    /// Sync per-host validation invoked from the host_cache actor. Checks OS and thread-mode
+    /// compatibility - subscription burst is enforced by the Lua booking call inside
+    /// `dispatch_virtual_proc` (see comment at the call site).
+    fn validate_match(host: &Host, os: Option<&str>, threadable: bool) -> bool {
+        Self::host_matches_layer_os(host, os) && Self::host_matches_thread_mode(host, threadable)
     }
 
     /// Processes a single layer by finding host candidates and attempting dispatch.
@@ -269,32 +246,27 @@ impl MatchingService {
                 layer.show_id
             );
 
-            // Clone only the minimal data needed for the validation closure
-            // These are needed because the closure must have 'static lifetime for actor messaging
-            let layer_id = layer.id;
-            let show_id = layer.show_id;
+            // Subscription burst pre-check was removed in PR-C: the Lua booking call inside
+            // `dispatch_virtual_proc` is now the authoritative gate. An over-burst (show, alloc)
+            // produces a single wasted dispatch attempt - design accepts that trade-off (see
+            // §2.1 and the PR-C plan; restoring the optimization would require an async
+            // validation hook on the host_cache actor or a per-process subscription mirror).
+            //
+            // TODO: if over-burst attempts become a measurable perf drag, add a precomputed
+            // per-layer Redis snapshot of (show, alloc) → bookable and consult it here.
             let cores_requested = layer.cores_min;
-            let allocation_service = self.allocation_service.clone();
             let os = layer.str_os.clone();
+            let threadable = layer.threadable;
 
             let host_candidate = self
                 .host_service
                 .send(CheckOut {
-                    facility_id: layer.facility_id,
+                    facility_id: layer.facility_id.clone(),
                     show_id: layer.show_id,
                     tags,
                     cores: cores_requested,
                     memory: layer.mem_min,
-                    validation: move |host| {
-                        Self::validate_match(
-                            host,
-                            &layer_id,
-                            &show_id,
-                            cores_requested,
-                            &allocation_service,
-                            os.as_deref(),
-                        )
-                    },
+                    validation: move |host| Self::validate_match(host, os.as_deref(), threadable),
                 })
                 .await
                 .expect("Host Cache actor is unresponsive");
@@ -498,5 +470,95 @@ impl MatchingService {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytesize::ByteSize;
+    use opencue_proto::host::ThreadMode;
+    use uuid::Uuid;
+
+    use super::MatchingService;
+    use crate::models::{CoreSize, Host};
+
+    fn host_with_os(str_os: Option<&str>) -> Host {
+        host_with(str_os, ThreadMode::Variable)
+    }
+
+    fn host_with_thread_mode(thread_mode: ThreadMode) -> Host {
+        host_with(Some("Linux"), thread_mode)
+    }
+
+    fn host_with(str_os: Option<&str>, thread_mode: ThreadMode) -> Host {
+        Host::new_for_test(
+            Uuid::new_v4(),
+            "test-host".to_string(),
+            str_os.map(str::to_string),
+            CoreSize::from_multiplied(100),
+            ByteSize::gb(64),
+            CoreSize::from_multiplied(100),
+            ByteSize::gb(64),
+            0,
+            ByteSize::gb(0),
+            thread_mode,
+            CoreSize::from_multiplied(100),
+            Uuid::new_v4(),
+            "test-alloc".to_string(),
+        )
+    }
+
+    #[test]
+    fn host_matches_when_layer_os_is_not_set() {
+        let host = host_with_os(Some("Linux"));
+
+        assert!(MatchingService::host_matches_layer_os(&host, None));
+    }
+
+    #[test]
+    fn host_matches_when_layer_os_matches_host_os() {
+        let host = host_with_os(Some("Linux"));
+
+        assert!(MatchingService::host_matches_layer_os(&host, Some("Linux")));
+    }
+
+    #[test]
+    fn host_does_not_match_when_layer_os_differs_from_host_os() {
+        let host = host_with_os(Some("Linux"));
+
+        assert!(!MatchingService::host_matches_layer_os(
+            &host,
+            Some("Windows")
+        ));
+    }
+
+    #[test]
+    fn thread_mode_all_rejects_non_threadable_layer() {
+        let host = host_with_thread_mode(ThreadMode::All);
+
+        assert!(!MatchingService::host_matches_thread_mode(&host, false));
+    }
+
+    #[test]
+    fn thread_mode_all_accepts_threadable_layer() {
+        let host = host_with_thread_mode(ThreadMode::All);
+
+        assert!(MatchingService::host_matches_thread_mode(&host, true));
+    }
+
+    #[test]
+    fn thread_mode_variable_accepts_any_threadability() {
+        let host = host_with_thread_mode(ThreadMode::Variable);
+
+        assert!(MatchingService::host_matches_thread_mode(&host, true));
+        assert!(MatchingService::host_matches_thread_mode(&host, false));
+    }
+
+    #[test]
+    fn thread_mode_auto_accepts_any_threadability() {
+        let host = host_with_thread_mode(ThreadMode::Auto);
+
+        assert!(MatchingService::host_matches_thread_mode(&host, true));
+        assert!(MatchingService::host_matches_thread_mode(&host, false));
     }
 }
